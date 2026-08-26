@@ -1,11 +1,15 @@
 // ==========================================
-// WhatsApp Bot b Gemini AI (Mجاني وخدام 24/24 f Render)
+// WhatsApp Bot b Gemini AI - b Baileys (khafif, bla Chrome/Puppeteer)
 // ==========================================
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode');
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useMultiFileAuthState,
+} = require('@whiskeysockets/baileys');
+const P = require('pino');
 const express = require('express');
+const QRCode = require('qrcode');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // ---------- Config ----------
@@ -14,7 +18,7 @@ const SYSTEM_PROMPT = `Nta bot dyal khedma dyal [سمي شركتك/خدمتك ه
 Jaweb b darija maghribiya, b tariqa mohtarama o mofida.
 Ila chi haja ma3reftihach, gol l client bach yestena rd men chi wa7d mn l ekip.`;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // ghadi ndirouha f Render Environment Variables
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 // ---------- Gemini Setup ----------
@@ -33,7 +37,7 @@ async function getAIReply(userMessage) {
   }
 }
 
-// ---------- Express server (bach Render ybqa 3aref l bot 7ay + bach n3ardo l QR) ----------
+// ---------- Express server (bach n3ardo l QR) ----------
 const app = express();
 let latestQR = null;
 let botStatus = 'Katbda...';
@@ -58,51 +62,59 @@ app.get('/', async (req, res) => {
 
 app.listen(PORT, () => console.log(`Server khedam 3la port ${PORT}`));
 
-// ---------- WhatsApp Client ----------
-const client = new Client({
-  authStrategy: new LocalAuth(),
-  puppeteer: {
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu',
-    ],
-  },
-});
+// ---------- WhatsApp Connection (Baileys) ----------
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
-client.on('qr', (qr) => {
-  console.log('QR jdid, dor l page dyal Render bach tchouf QR code');
-  latestQR = qr;
-  botStatus = 'Kayntader QR scan';
-  qrcode.generate(qr, { small: true }); // ghadi yban ossi f logs
-});
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    logger: P({ level: 'silent' }),
+  });
 
-client.on('ready', () => {
-  console.log('Bot khedam! WhatsApp mrbota.');
-  botStatus = 'Khedam ✅';
-  latestQR = null;
-});
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.on('disconnected', () => {
-  botStatus = 'Manqte3 ❌';
-});
+    if (qr) {
+      latestQR = qr;
+      botStatus = 'Kayntader QR scan';
+      console.log('QR jdid, dor l page dyal Render bach tchouf QR code');
+    }
 
-client.on('message', async (message) => {
-  // Ma tjawebch f les groupes (ila bghiti tjaweb f groupes, 7yed had l condition)
-  const chat = await message.getChat();
-  if (chat.isGroup) return;
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      botStatus = 'Manqte3, kaya3awed...';
+      console.log('Connection closed, reconnecting:', shouldReconnect);
+      if (shouldReconnect) connectToWhatsApp();
+    } else if (connection === 'open') {
+      console.log('Bot khedam! WhatsApp mrbota.');
+      botStatus = 'Khedam ✅';
+      latestQR = null;
+    }
+  });
 
-  console.log(`Risala jdida men ${message.from}: ${message.body}`);
+  sock.ev.on('creds.update', saveCreds);
 
-  const reply = await getAIReply(message.body);
-  await chat.sendMessage(reply);
-});
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
 
-client.initialize();
+    // Ma tjawebch f les groupes (ila bghiti tjaweb f groupes, 7yed had l condition)
+    if (msg.key.remoteJid?.endsWith('@g.us')) return;
+
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      '';
+
+    if (!text) return;
+
+    console.log(`Risala jdida men ${msg.key.remoteJid}: ${text}`);
+
+    const reply = await getAIReply(text);
+    await sock.sendMessage(msg.key.remoteJid, { text: reply });
+  });
+}
+
+connectToWhatsApp();
